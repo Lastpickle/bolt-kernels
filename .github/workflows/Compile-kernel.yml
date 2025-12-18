@@ -42,14 +42,14 @@ jobs:
         run: |
           if [ ! -d "KernelSU" ]; then
             echo "Setting up ksu..."
-            curl -LSs "https://raw.githubusercontent.com/rsuntk/KernelSU/refs/heads/susfs-rksu-master/kernel/setup.sh" | bash -
+            curl -LSs "https://raw.githubusercontent.com/rsuntk/KernelSU/refs/heads/susfs-rksu-master/kernel/setup.sh" | bash -s susfs-rksu-master
           else
             echo "Skipping..."
           fi
 
       - name: Patch SusFS
         run: |
-           Apply New SusFS KSUN Patch
+          # Apply New SusFS KSUN Patch
            cd KernelSU
            curl -Ls https://github.com/sidex15/KernelSU/commit/8be13a387a7b32f6c70b9077a97c30840254f630.patch | patch -p1 -F 3
           # curl -Ls https://github.com/sidex15/KernelSU-Next/commit/effdc4fc06820afde70dd1b5e94658304efdb2ab.patch | patch -p1 -F 3
