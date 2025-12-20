@@ -82,7 +82,6 @@ jobs:
       
       - name: Configure Git
         run: |
-          # Use the GitHub user who triggered the workflow as committer
           git config user.name "${{ github.actor }}"
           git config user.email "${{ github.actor }}@users.noreply.github.com"
       
@@ -127,11 +126,8 @@ jobs:
           echo "=========================================="
           echo ""
           
-          # Parse file replacements - handle both newlines and ensure proper parsing
-          REPLACEMENTS=$(cat << 'EOF'
-          ${{ github.event.inputs.file_replacements }}
-          EOF
-          )
+          REPLACEMENTS="${{ github.event.inputs.file_replacements }}"
+          REPLACEMENTS=$(echo "$REPLACEMENTS" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$')
           
           SUCCESS=0
           FAILED=0
@@ -140,73 +136,79 @@ jobs:
           TOTAL_ADDITIONS=0
           TOTAL_DELETIONS=0
           
-          # Store current state for comparison
           mkdir -p /tmp/file_comparison
           
           echo "Parsing file replacements..."
-          echo "$REPLACEMENTS" | while IFS= read -r line; do
+          echo ""
+          
+          while IFS= read -r line; do
+            line=$(echo "$line" | xargs)
             [ -z "$line" ] && continue
             
-            # Parse line: filepath=url
+            if ! echo "$line" | grep -q '='; then
+              echo "⚠ Skipping invalid line (no '=' found): $line"
+              echo ""
+              continue
+            fi
+            
             FILE_PATH=$(echo "$line" | cut -d'=' -f1 | xargs)
             RAW_URL=$(echo "$line" | cut -d'=' -f2- | xargs)
+            
+            if [ -z "$FILE_PATH" ] || [ -z "$RAW_URL" ]; then
+              echo "⚠ Skipping invalid line: $line"
+              echo ""
+              continue
+            fi
             
             echo "----------------------------------------"
             echo "File: $FILE_PATH"
             echo "Source: $RAW_URL"
             echo ""
             
-            # Create directory if it doesn't exist
             FILE_DIR=$(dirname "$FILE_PATH")
             mkdir -p "$FILE_DIR"
             
-            # Check if file exists and backup for comparison
             FILE_EXISTS=false
             if [ -f "$FILE_PATH" ]; then
               FILE_EXISTS=true
-              cp "$FILE_PATH" "/tmp/file_comparison/$(basename $FILE_PATH).old"
+              FILE_HASH=$(echo "$FILE_PATH" | md5sum | cut -d' ' -f1)
+              cp "$FILE_PATH" "/tmp/file_comparison/${FILE_HASH}.old"
               echo "Status: File exists, will be replaced"
             else
+              FILE_HASH=$(echo "$FILE_PATH" | md5sum | cut -d' ' -f1)
               echo "Status: New file will be created"
             fi
             
-            # Download the new content
-            if curl -f -L -s "$RAW_URL" -o "/tmp/file_comparison/$(basename $FILE_PATH).new"; then
+            if curl -f -L -s "$RAW_URL" -o "/tmp/file_comparison/${FILE_HASH}.new"; then
               echo "✓ Downloaded successfully"
               
               if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
-                # Dry run - just show what would change
                 if [ "$FILE_EXISTS" = true ]; then
                   echo ""
                   echo "Changes that would be made:"
                   echo "-----------------------------------"
-                  diff -u "/tmp/file_comparison/$(basename $FILE_PATH).old" "/tmp/file_comparison/$(basename $FILE_PATH).new" || true
+                  diff -u "/tmp/file_comparison/${FILE_HASH}.old" "/tmp/file_comparison/${FILE_HASH}.new" || true
                   echo "-----------------------------------"
                   
-                  # Count changes
-                  ADDS=$(diff "/tmp/file_comparison/$(basename $FILE_PATH).old" "/tmp/file_comparison/$(basename $FILE_PATH).new" | grep -c "^>" || echo "0")
-                  DELS=$(diff "/tmp/file_comparison/$(basename $FILE_PATH).old" "/tmp/file_comparison/$(basename $FILE_PATH).new" | grep -c "^<" || echo "0")
+                  ADDS=$(diff "/tmp/file_comparison/${FILE_HASH}.old" "/tmp/file_comparison/${FILE_HASH}.new" 2>/dev/null | grep -c "^>" || echo "0")
+                  DELS=$(diff "/tmp/file_comparison/${FILE_HASH}.old" "/tmp/file_comparison/${FILE_HASH}.new" 2>/dev/null | grep -c "^<" || echo "0")
                   echo "Lines added: $ADDS, Lines removed: $DELS"
                 else
-                  LINES=$(wc -l < "/tmp/file_comparison/$(basename $FILE_PATH).new")
+                  LINES=$(wc -l < "/tmp/file_comparison/${FILE_HASH}.new")
                   echo "New file would be created with $LINES lines"
-                  ADDS=$LINES
-                  DELS=0
                 fi
               else
-                # Actually replace the file
-                cp "/tmp/file_comparison/$(basename $FILE_PATH).new" "$FILE_PATH"
+                cp "/tmp/file_comparison/${FILE_HASH}.new" "$FILE_PATH"
                 
                 if [ "$FILE_EXISTS" = true ]; then
                   echo ""
                   echo "File replaced. Changes made:"
                   echo "-----------------------------------"
-                  diff -u "/tmp/file_comparison/$(basename $FILE_PATH).old" "/tmp/file_comparison/$(basename $FILE_PATH).new" || true
+                  diff -u "/tmp/file_comparison/${FILE_HASH}.old" "/tmp/file_comparison/${FILE_HASH}.new" || true
                   echo "-----------------------------------"
                   
-                  # Count changes
-                  ADDS=$(diff "/tmp/file_comparison/$(basename $FILE_PATH).old" "/tmp/file_comparison/$(basename $FILE_PATH).new" | grep -c "^>" || echo "0")
-                  DELS=$(diff "/tmp/file_comparison/$(basename $FILE_PATH).old" "/tmp/file_comparison/$(basename $FILE_PATH).new" | grep -c "^<" || echo "0")
+                  ADDS=$(diff "/tmp/file_comparison/${FILE_HASH}.old" "/tmp/file_comparison/${FILE_HASH}.new" 2>/dev/null | grep -c "^>" || echo "0")
+                  DELS=$(diff "/tmp/file_comparison/${FILE_HASH}.old" "/tmp/file_comparison/${FILE_HASH}.new" 2>/dev/null | grep -c "^<" || echo "0")
                   echo "Lines added: $ADDS, Lines removed: $DELS"
                 else
                   LINES=$(wc -l < "$FILE_PATH")
@@ -228,12 +230,7 @@ jobs:
             fi
             
             echo ""
-          done
-          
-          # Since we're in a subshell from the pipe, we need to read the results from a file
-          if [ -f /tmp/replacement_summary.txt ]; then
-            source /tmp/replacement_summary.txt
-          fi
+          done <<< "$REPLACEMENTS"
           
           echo "=========================================="
           echo "File Replacement Summary:"
@@ -264,14 +261,11 @@ jobs:
       - name: Commit file replacements
         if: github.event.inputs.patch_source_type == 'replace-files' && github.event.inputs.dry_run == 'false'
         run: |
-          # Check if there are any changes
           if ! git diff --quiet; then
             echo "Committing changes..."
             
-            # Build commit message
             COMMIT_MSG="${{ github.event.inputs.replacement_commit_message }}"
             
-            # Add file list to commit message
             COMMIT_MSG="$COMMIT_MSG
 
           Files updated:
@@ -455,11 +449,9 @@ jobs:
         if: github.event.inputs.patch_source_type == 'repo-commits'
         id: download_patches_repo
         run: |
-          # Parse comma or space separated commits
           COMMITS="${{ github.event.inputs.commit_hashes }}"
           COMMITS=$(echo "$COMMITS" | tr ',' ' ' | tr -s ' ')
           
-          # Clean repo URL (remove .git suffix if present)
           REPO_URL="${{ github.event.inputs.source_repo }}"
           REPO_URL="${REPO_URL%.git}"
           
@@ -480,7 +472,6 @@ jobs:
             if curl -f -L -s "$PATCH_URL" -o "$PATCH_FILE"; then
               echo "✓ Downloaded: $PATCH_URL"
               
-              # Show patch info
               echo "Patch subject:"
               head -n 20 "$PATCH_FILE" | grep -E "^(Subject|From|Date):" || true
               
@@ -507,7 +498,6 @@ jobs:
         if: github.event.inputs.patch_source_type == 'raw-urls'
         id: download_patches_raw
         run: |
-          # Parse URLs (support both comma and newline separation)
           URLS="${{ github.event.inputs.raw_patch_urls }}"
           URLS=$(echo "$URLS" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$')
           
@@ -525,7 +515,6 @@ jobs:
             
             echo "[$COUNTER] Downloading patch from: $url"
             
-            # Generate filename from URL or use counter
             FILENAME=$(basename "$url" .patch)
             FILENAME=$(echo "$FILENAME" | sed 's/[^a-zA-Z0-9._-]/_/g')
             PATCH_FILE="/tmp/patches/${COUNTER}_${FILENAME}.patch"
@@ -533,7 +522,6 @@ jobs:
             if curl -f -L -s "$url" -o "$PATCH_FILE"; then
               echo "✓ Downloaded successfully"
               
-              # Show patch info
               echo "Patch details:"
               head -n 30 "$PATCH_FILE" | grep -E "^(Subject|From|Date|---)" || true
               
@@ -579,7 +567,6 @@ jobs:
           PARTIAL=0
           FAILED=0
           
-          # Create temp directory for reject files
           mkdir -p /tmp/rejects
           
           for patch_file in /tmp/patches/*.patch; do
@@ -590,7 +577,6 @@ jobs:
             echo "Testing: $PATCH_NAME"
             echo ""
             
-            # Pre-create directories for new files in the patch (for dry-run testing)
             echo "Checking for new files in patch..."
             NEW_FILES=$(grep -E "^\+\+\+ b/" "$patch_file" | sed 's|^+++ b/||' || true)
             for new_file in $NEW_FILES; do
@@ -607,11 +593,9 @@ jobs:
             
             REJECT_FILE="/tmp/rejects/${PATCH_NAME}.rej"
             
-            # Use -N flag to handle new files
             if patch --dry-run -p1 -N -F ${{ github.event.inputs.fuzz_factor }} -l --no-backup-if-mismatch --reject-file="$REJECT_FILE" < "$patch_file" 2>&1 | tee /tmp/patch_output.txt; then
               echo "✓ Would apply cleanly"
               
-              # Show what would change
               echo ""
               if grep -q "creating" /tmp/patch_output.txt; then
                 echo "New files that would be created:"
@@ -624,7 +608,6 @@ jobs:
               
               SUCCESS=$((SUCCESS + 1))
             else
-              # Check if reject file was created
               if [ -f "$REJECT_FILE" ]; then
                 echo "⚠ Would apply partially (some hunks would fail)"
                 echo ""
@@ -639,7 +622,6 @@ jobs:
                 FAILED=$((FAILED + 1))
               fi
               
-              # Show failed hunks from output
               if grep -q "Hunk.*FAILED" /tmp/patch_output.txt; then
                 echo ""
                 echo "Failed hunks summary:"
@@ -675,7 +657,6 @@ jobs:
           FAILED_PATCHES=""
           PARTIAL_PATCHES=""
           
-          # Create temp directory for reject files (not in source tree)
           mkdir -p /tmp/rejects
           
           for patch_file in /tmp/patches/*.patch; do
@@ -686,36 +667,53 @@ jobs:
             echo "Applying: $PATCH_NAME"
             echo ""
             
-            # Extract commit metadata from patch file
-            SUBJECT=$(grep -m1 "^Subject:" "$patch_file" | sed 's/^Subject: //' | sed 's/^\[PATCH[^]]*\] *//')
+            # Extract full commit message from patch
             AUTHOR=$(grep -m1 "^From:" "$patch_file" | sed 's/^From: //')
             DATE=$(grep -m1 "^Date:" "$patch_file" | sed 's/^Date: //')
             
-            # Extract author name and email separately for git commit
             AUTHOR_NAME=""
             AUTHOR_EMAIL=""
             if [ -n "$AUTHOR" ]; then
-              # Parse "Name <email>" format
               AUTHOR_NAME=$(echo "$AUTHOR" | sed 's/\s*<.*$//')
               AUTHOR_EMAIL=$(echo "$AUTHOR" | grep -o '<.*>' | tr -d '<>')
             fi
             
-            # If no proper headers, try to extract from git format-patch style
-            if [ -z "$SUBJECT" ]; then
-              SUBJECT=$(head -n 50 "$patch_file" | grep -v "^From " | grep -v "^---" | grep -v "^diff" | grep -v "^index" | head -n 1)
+            # Extract the complete commit message including all text between Subject and ---
+            # This preserves the full description, signed-off-by, and all metadata
+            COMMIT_MESSAGE=$(awk '
+              BEGIN { in_message=0; message="" }
+              /^Subject:/ { 
+                in_message=1
+                sub(/^Subject: (\[PATCH[^]]*\] )?/, "")
+                message=$0"\n"
+                next
+              }
+              /^---$/ { 
+                if (in_message) exit 
+              }
+              in_message && !/^(From:|Date:|index |diff |new file|deleted file|similarity index|rename )/ {
+                message=message$0"\n"
+              }
+              END { 
+                # Remove trailing empty lines
+                gsub(/\n+$/, "\n", message)
+                print message
+              }
+            ' "$patch_file")
+            
+            # Fallback if extraction failed
+            if [ -z "$COMMIT_MESSAGE" ]; then
+              COMMIT_MESSAGE="$PATCH_NAME"
             fi
             
-            # Fallback to filename if still empty
-            if [ -z "$SUBJECT" ]; then
-              SUBJECT="$PATCH_NAME"
-            fi
+            # Extract just the subject line for display
+            SUBJECT=$(echo "$COMMIT_MESSAGE" | head -n1)
             
             echo "Subject: $SUBJECT"
             [ -n "$AUTHOR" ] && echo "Author: $AUTHOR"
             [ -n "$DATE" ] && echo "Date: $DATE"
             echo ""
             
-            # Pre-create directories for new files in the patch
             echo "Checking for new files in patch..."
             NEW_FILES=$(grep -E "^\+\+\+ b/" "$patch_file" | sed 's|^+++ b/||' || true)
             for new_file in $NEW_FILES; do
@@ -731,19 +729,10 @@ jobs:
             
             REJECT_FILE="/tmp/rejects/${PATCH_NAME}.rej"
             
-            # Apply patch with options to handle new files:
-            # -p1: Strip one level of path
-            # -F: Fuzz factor (higher = more tolerant)
-            # -l: Ignore whitespace changes
-            # --ignore-whitespace: Ignore whitespace differences
-            # --no-backup-if-mismatch: Don't create .orig files
-            # --reject-file: Save rejects to temp location
-            # -N: Treat absent files as empty (allows creating new files)
             if patch -p1 -N -F ${{ github.event.inputs.fuzz_factor }} -l --ignore-whitespace --no-backup-if-mismatch --reject-file="$REJECT_FILE" < "$patch_file" 2>&1 | tee /tmp/patch_output.txt; then
               echo "✓ Applied successfully"
               SUCCESS=$((SUCCESS + 1))
               
-              # Show which files were created vs modified
               echo ""
               if grep -q "creating" /tmp/patch_output.txt; then
                 echo "New files created:"
@@ -755,37 +744,22 @@ jobs:
               fi
               echo ""
               
-              # Create commit with original author information
-              COMMIT_MSG="$SUBJECT"
-              
-              # Add source info to commit message body
-              if [ "${{ github.event.inputs.patch_source_type }}" = "repo-commits" ]; then
-                COMMIT_HASH=$(echo "$PATCH_NAME" | grep -oE '[a-f0-9]{7,}')
-                COMMIT_MSG="${COMMIT_MSG}
-
-          Source: ${{ github.event.inputs.source_repo }}/commit/$COMMIT_HASH"
-              fi
-              
-              # Stage the changes
+              # Use the full commit message exactly as extracted (no additions)
               git add -A
               
-              # Commit with original author if available
               if [ -n "$AUTHOR_NAME" ] && [ -n "$AUTHOR_EMAIL" ]; then
-                # Use original author and date if available
                 if [ -n "$DATE" ]; then
-                  GIT_AUTHOR_NAME="$AUTHOR_NAME" GIT_AUTHOR_EMAIL="$AUTHOR_EMAIL" GIT_AUTHOR_DATE="$DATE" git commit -m "$COMMIT_MSG" || true
+                  GIT_AUTHOR_NAME="$AUTHOR_NAME" GIT_AUTHOR_EMAIL="$AUTHOR_EMAIL" GIT_AUTHOR_DATE="$DATE" git commit -m "$COMMIT_MESSAGE" || true
                 else
-                  GIT_AUTHOR_NAME="$AUTHOR_NAME" GIT_AUTHOR_EMAIL="$AUTHOR_EMAIL" git commit -m "$COMMIT_MSG" || true
+                  GIT_AUTHOR_NAME="$AUTHOR_NAME" GIT_AUTHOR_EMAIL="$AUTHOR_EMAIL" git commit -m "$COMMIT_MESSAGE" || true
                 fi
                 echo "✓ Committed as: $AUTHOR_NAME <$AUTHOR_EMAIL>"
               else
-                # Fallback to github-actions bot
-                git commit -m "$COMMIT_MSG" || true
-                echo "✓ Committed as: github-actions[bot]"
+                git commit -m "$COMMIT_MESSAGE" || true
+                echo "✓ Committed as: ${{ github.actor }}"
               fi
               
             else
-              # Check if reject file was created
               if [ -f "$REJECT_FILE" ]; then
                 echo "⚠ Applied partially (some hunks failed)"
                 echo ""
@@ -801,17 +775,22 @@ jobs:
                   "continue-with-rejects")
                     echo "→ Continuing (reject file saved to /tmp/rejects/)"
                     
-                    # Create commit message for partial patch
-                    COMMIT_MSG="[PARTIAL] $SUBJECT
+                    PARTIAL_COMMIT_MSG="[PARTIAL] $COMMIT_MESSAGE
 
           ⚠️ This patch was partially applied. Some hunks failed.
-          Check workflow logs for rejected hunks.
-          "
-                    [ -n "$AUTHOR" ] && COMMIT_MSG="${COMMIT_MSG}
-          Original-author: $AUTHOR"
+          Check workflow logs for rejected hunks."
                     
                     git add -A
-                    git commit -m "$COMMIT_MSG" || true
+                    
+                    if [ -n "$AUTHOR_NAME" ] && [ -n "$AUTHOR_EMAIL" ]; then
+                      if [ -n "$DATE" ]; then
+                        GIT_AUTHOR_NAME="$AUTHOR_NAME" GIT_AUTHOR_EMAIL="$AUTHOR_EMAIL" GIT_AUTHOR_DATE="$DATE" git commit -m "$PARTIAL_COMMIT_MSG" || true
+                      else
+                        GIT_AUTHOR_NAME="$AUTHOR_NAME" GIT_AUTHOR_EMAIL="$AUTHOR_EMAIL" git commit -m "$PARTIAL_COMMIT_MSG" || true
+                      fi
+                    else
+                      git commit -m "$PARTIAL_COMMIT_MSG" || true
+                    fi
                     ;;
                   "skip-failed-patches")
                     echo "⊘ Skipping this patch"
@@ -866,7 +845,6 @@ jobs:
             echo "✓ No reject files found - all patches applied cleanly"
           fi
           
-          # Verify no .rej or .orig files in source tree
           echo ""
           echo "Verifying source tree is clean..."
           if find . -name "*.rej" -o -name "*.orig" | grep -q .; then
@@ -880,9 +858,10 @@ jobs:
       - name: Push changes
         if: github.event.inputs.dry_run == 'false'
         run: |
-          # Check which mode was used and get appropriate success count
           if [ "${{ github.event.inputs.patch_source_type }}" = "replace-files" ]; then
             SUCCESS_COUNT="${{ steps.replace_files.outputs.success_count }}"
+          elif [ "${{ github.event.inputs.patch_source_type }}" = "revert-commits" ]; then
+            SUCCESS_COUNT="${{ steps.revert_commits.outputs.success_count }}"
           else
             SUCCESS_COUNT="${{ steps.apply_patches.outputs.success_count }}"
           fi
@@ -984,33 +963,6 @@ jobs:
             body += `\nReject files are saved in workflow logs under /tmp/rejects/ for manual review.\nThe source tree remains clean with no .rej or .orig files.`;
             
             await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title: 'Patch Application Summary: ' + new Date().toISOString().split('T')[0],
-              body: body,
-              labels: ['patch', 'kernel-update']
-            });Info}
-            **Target branch:** ${{ github.event.inputs.target_branch }}
-            **Fuzz factor:** ${{ github.event.inputs.fuzz_factor }}
-            **Reject strategy:** ${{ github.event.inputs.reject_strategy }}
-            
-            ### Results
-            - ✅ Successfully applied: ${{ steps.apply_patches.outputs.success_count }}
-            - ⚠️ Partially applied: ${partialCount}
-            - ❌ Failed: ${failedCount}
-            `;
-            
-            if (partialCount !== '0') {
-              body += `\n### Partially Applied Patches\n\`\`\`\n${{ steps.apply_patches.outputs.partial_patches }}\n\`\`\`\n`;
-            }
-            
-            if (failedCount !== '0') {
-              body += `\n### Failed Patches\n\`\`\`\n${{ steps.apply_patches.outputs.failed_patches }}\n\`\`\`\n`;
-            }
-            
-            body += `\nReject files are saved in workflow logs under /tmp/rejects/ for manual review.\nThe source tree remains clean with no .rej or .orig files.`;
-            
-            github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
               title: 'Patch Application Summary: ' + new Date().toISOString().split('T')[0],
